@@ -4,14 +4,15 @@
 import serial
 import threading
 import time
-import sys
-from colorama import init, Fore, Style
 import re
+import os
+from datetime import datetime
+from colorama import init, Fore
 
 # =========================================================
 # Global Config
 # =========================================================
-ANSI_ESCAPE = re.compile(r'\x1B[@-_][0-?]*[ -/]*[@-~]')
+
 SERIAL_PORT = "COM10"
 BAUDRATE = 921600
 READ_TIMEOUT = 0.1
@@ -22,10 +23,15 @@ RESET_DELAY_SEC = 1.0
 RESET_COMMAND = "reset\r\n"
 
 TRIGGER_KEYWORD = "TX3_STATUS_OFFLINE TO CONNECTED..."
-STOP_KEYWORD = "Retrying ...(5/5)"
+STOP_KEYWORD = "SEND...(3/5)"
 
 HEX_OUTPUT_ENABLE = False
 ASCII_OUTPUT_ENABLE = True
+
+LOG_ENABLE = True
+LOG_FOLDER = "logs"
+
+ANSI_ESCAPE = re.compile(r'\x1B[@-_][0-?]*[ -/]*[@-~]')
 
 # =========================================================
 # Runtime State
@@ -34,6 +40,8 @@ ASCII_OUTPUT_ENABLE = True
 loop_count = 0
 running = True
 trigger_pending = False
+
+log_file = None
 
 # =========================================================
 # ANSI Color Helper
@@ -57,11 +65,22 @@ def log_hex(msg):
     print(Fore.MAGENTA + msg)
 
 # =========================================================
-# HEX Display
+# Utils
 # =========================================================
 
 def bytes_to_hex(data):
     return ' '.join(f'{b:02X}' for b in data)
+
+def clear_screen():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def write_log(text):
+    global log_file
+
+    if LOG_ENABLE and log_file:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        log_file.write(f"[{timestamp}] {text}\n")
+        log_file.flush()
 
 # =========================================================
 # Serial RX Thread
@@ -80,9 +99,11 @@ def serial_rx_worker(ser):
             data = ser.read(1024)
 
             if data:
-                # HEX Output
+
                 if HEX_OUTPUT_ENABLE:
-                    log_hex("[HEX] " + bytes_to_hex(data))
+                    hex_msg = "[HEX] " + bytes_to_hex(data)
+                    log_hex(hex_msg)
+                    write_log(hex_msg)
 
                 line_buffer += data
 
@@ -91,33 +112,33 @@ def serial_rx_worker(ser):
 
                     try:
                         raw_text = line.decode(errors='ignore').strip()
-
-                        # Remove ANSI Escape Codes
                         text = ANSI_ESCAPE.sub('', raw_text)
 
                     except:
                         raw_text = ""
                         text = ""
 
-                    # 顯示原始內容（保留ANSI色彩）
                     if ASCII_OUTPUT_ENABLE and raw_text:
                         print("[RX ] " + raw_text)
+                        write_log("[RX ] " + text)
 
-                    # keyword matching 使用 clean text
                     if STOP_KEYWORD in text:
                         log_warn("STOP KEYWORD DETECTED")
                         log_warn("AUTO RESET DISABLED")
+                        write_log("[EVENT] AUTO RESET DISABLED")
 
                         AUTO_RESET_ENABLE = False
 
                     if TRIGGER_KEYWORD in text:
                         log_ok("TRIGGER DETECTED")
+                        write_log("[EVENT] TRIGGER DETECTED")
 
                         if AUTO_RESET_ENABLE:
                             trigger_pending = True
 
         except Exception as e:
             log_err(f"RX Exception: {e}")
+            write_log(f"[ERROR] RX Exception: {e}")
             running = False
 
 # =========================================================
@@ -135,6 +156,8 @@ def reset_worker(ser):
             trigger_pending = False
 
             log_warn(f"Wait {RESET_DELAY_SEC} sec before reset...")
+            write_log(f"[EVENT] Wait {RESET_DELAY_SEC} sec before reset")
+
             time.sleep(RESET_DELAY_SEC)
 
             try:
@@ -142,12 +165,12 @@ def reset_worker(ser):
 
                 loop_count += 1
 
-                log_ok(
-                    f"RESET SENT -> Loop Count = {loop_count}"
-                )
+                log_ok(f"RESET SENT -> Loop Count = {loop_count}")
+                write_log(f"[TX ] {RESET_COMMAND.strip()}")
 
             except Exception as e:
                 log_err(f"TX Exception: {e}")
+                write_log(f"[ERROR] TX Exception: {e}")
                 running = False
 
         time.sleep(0.05)
@@ -159,14 +182,18 @@ def reset_worker(ser):
 def cli_worker(ser):
     global running
     global loop_count
+    global AUTO_RESET_ENABLE
 
-    help_text = f"""
+    help_text = """
 Commands:
 ------------------------------------------------
 help            : show help
 status          : show current status
 reset           : send reset command
+pause           : disable auto reset
+resume          : enable auto reset
 count           : show loop count
+clear           : clear screen
 quit            : exit
 send <text>     : send custom text
 ------------------------------------------------
@@ -187,6 +214,8 @@ Running      : {running}
 Loop Count   : {loop_count}
 Port         : {SERIAL_PORT}
 Baudrate     : {BAUDRATE}
+Auto Reset   : {AUTO_RESET_ENABLE}
+Log Enable   : {LOG_ENABLE}
 """)
 
             elif cmd == "count":
@@ -195,22 +224,33 @@ Baudrate     : {BAUDRATE}
             elif cmd == "reset":
                 ser.write(RESET_COMMAND.encode())
                 log_ok("Manual RESET sent")
+                write_log("[TX ] Manual RESET")
 
-            elif cmd.startswith("send "):
-                text = cmd[5:]
-                ser.write(text.encode())
-                log_ok(f"SEND -> {text}")
-
-            elif cmd == "quit":
-                log_warn("Exit requested")
-                running = False
-                break
-            elif cmd == "resume":
-                AUTO_RESET_ENABLE = True
-                log_ok("AUTO RESET ENABLED")
             elif cmd == "pause":
                 AUTO_RESET_ENABLE = False
                 log_warn("AUTO RESET DISABLED")
+                write_log("[EVENT] AUTO RESET DISABLED")
+
+            elif cmd == "resume":
+                AUTO_RESET_ENABLE = True
+                log_ok("AUTO RESET ENABLED")
+                write_log("[EVENT] AUTO RESET ENABLED")
+
+            elif cmd == "clear":
+                clear_screen()
+
+            elif cmd.startswith("send "):
+                text = cmd[5:]
+                ser.write((text + "\r\n").encode())
+                log_ok(f"SEND -> {text}\r\n")
+                write_log(f"[TX ] {text}")
+
+            elif cmd == "quit":
+                log_warn("Exit requested")
+                write_log("[EVENT] Program Exit Requested")
+                running = False
+                break
+
             else:
                 log_warn("Unknown command")
 
@@ -220,6 +260,7 @@ Baudrate     : {BAUDRATE}
 
         except Exception as e:
             log_err(f"CLI Exception: {e}")
+            write_log(f"[ERROR] CLI Exception: {e}")
 
 # =========================================================
 # Main
@@ -227,6 +268,19 @@ Baudrate     : {BAUDRATE}
 
 def main():
     global running
+    global log_file
+
+    clear_screen()
+
+    if LOG_ENABLE:
+        os.makedirs(LOG_FOLDER, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"{LOG_FOLDER}/serial_log_{timestamp}.txt"
+
+        log_file = open(log_filename, "w", encoding="utf-8")
+
+        print(f"[LOG ] Save Log -> {log_filename}")
 
     log_info(f"Open Serial Port: {SERIAL_PORT}")
 
@@ -279,8 +333,10 @@ def main():
     except:
         pass
 
-    log_warn("Program Exit")
+    if log_file:
+        log_file.close()
 
+    log_warn("Program Exit")
 
 if __name__ == "__main__":
     main()
